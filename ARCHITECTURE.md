@@ -1,260 +1,221 @@
-# Mini Multimeter - Layered Architecture
+# Mini Multimeter Firmware Architecture
 
-## 1. Layer dependency rule
+This document describes the architecture of the checked-in Mini Multimeter firmware for the **STM32F103C8T6**. The firmware is bare-metal: a cooperative super-loop coordinates application work while peripheral interrupts handle time-sensitive acquisition and timing events.
 
-Dependencies only go downward:
+The design separates application state, measurement policy, hardware access, diagnostics, and MCU-facing platform code so each concern has a clear owner and lower-level modules never depend on higher-level behavior.
 
-```text
-Application
-    |
-    v
-Services
-    |
-    v
-Drivers
-    |
-    v
-Infrastructure
-    |
-    v
-Platform
-    |
-    v
-STM32F10x SPL / CMSIS / Hardware
+## 1. Architecture overview
+
+```mermaid
+flowchart TD
+    APP["Application\nmain · app controller · UI"]
+    SVC["Services\nmeasurement · configuration · signal generation"]
+    DRV["Drivers\nADC · buttons · capacitor · LCD · Flash · PWM"]
+    INF["Infrastructure\ndebug logger · error manager"]
+    PLT["Platform\nsystem init · timebase · UART"]
+    HAL["STM32F10x SPL / CMSIS / Hardware"]
+
+    APP --> SVC
+    APP --> DRV
+    APP --> INF
+    APP --> PLT
+    SVC --> DRV
+    SVC --> INF
+    SVC --> PLT
+    DRV --> INF
+    DRV --> PLT
+    DRV --> HAL
+    INF --> PLT
+    PLT --> HAL
 ```
 
-An upper layer may call a lower layer directly when it is a device-facing UI/bootstrap concern, but a lower layer must never include or call an upper layer.
+Dependencies flow downward. A higher layer may skip intermediate layers when ownership requires it—for example, `ui_view` writes through the LCD driver and `app_controller` performs bootstrap through driver/platform interfaces—but lower layers must not include or call higher-level application or service code.
 
-## 2. Project structure
+| Layer | May depend on | Must not depend on |
+|---|---|---|
+| Application | Services, Drivers, Infrastructure, Platform | — |
+| Services | Drivers, Infrastructure, Platform | Application |
+| Drivers | Infrastructure, Platform, STM32 SPL/CMSIS | Application, Services |
+| Infrastructure | Platform | Application, Services, Drivers |
+| Platform | STM32 SPL/CMSIS | Application, Services, Drivers, Infrastructure |
+
+## 2. Components and ownership
+
+| Area | Main modules | Responsibility |
+|---|---|---|
+| Application | `main`, `app_controller` | boot orchestration and top-level super-loop |
+| Application UI | `ui_controller`, `ui_view`, `ui_formatter` | state/navigation, LCD presentation, value formatting |
+| Services | `config_service` | runtime PWM settings and persistence requests |
+| Services | `measurement_service` | resistance/capacitance/frequency/duty workflows and measurement states |
+| Services | `signal_generator_service` | PWM validation and PSC/ARR/CCR calculation |
+| Drivers | `adc_driver`, `button_driver` | ADC acquisition/filtering and debounced button events |
+| Drivers | `capacitor_charge_driver` | capacitor charge/discharge GPIO control |
+| Drivers | `flash_storage_driver` | versioned, CRC-protected persistent settings record |
+| Drivers | `lcd1602_driver` | LCD1602/PCF8574 I2C transport and display I/O |
+| Drivers | `pwm_capture_driver`, `pwm_output_driver` | timer input capture and TIM2 CH2 output |
+| Infrastructure | `debug_logger`, `error_manager` | timestamped UART logs and centralized runtime error history |
+| Platform | `platform_init`, `system_time`, `uart_port` | MCU startup wrapper, 1 ms timebase, USART1 transport |
+| MDK | Keil project + CMSIS/RTE | toolchain, startup, device, and vendor configuration |
+
+Repository layout:
 
 ```text
-Application/
-  main.c
-  app_controller.c/.h
-  ui_controller.c/.h
-  ui_view.c/.h
-  ui_formatter.c/.h
-
-Services/
-  config_service.c/.h
-  measurement_service.c/.h
-  signal_generator_service.c/.h
-
-Drivers/
-  adc_driver.c/.h
-  button_driver.c/.h
-  capacitor_charge_driver.c/.h
-  flash_storage_driver.c/.h
-  lcd1602_driver.c/.h
-  pwm_capture_driver.c/.h
-  pwm_output_driver.c/.h
-
-Infrastructure/
-  debug_logger.c/.h
-  error_manager.c/.h
-
-Platform/
-  platform_init.c/.h
-  system_time.c/.h
-  uart_port.c/.h
-
-MDK/
-  Keil project + CMSIS/RTE/vendor files
+Application/        boot/application control and UI
+Services/           measurement, configuration, signal-generation policy
+Drivers/            peripheral-facing hardware access
+Infrastructure/     diagnostics and error management
+Platform/           shared MCU-facing services
+MDK/                Keil project and CMSIS/RTE/vendor files
 ```
 
-## 3. Responsibilities
+## 3. Runtime model
 
-### Application
-- `main.c`: only starts the application and executes the super-loop.
-- `app_controller`: boot order and top-level process loop.
-- `ui_controller`: menu FSM, navigation, cursor memory, transient UI states, and conversion of button events into use-case calls.
-- `ui_view`: LCD1602 presentation only: list rendering, titles, status messages, editors, and feedback screens.
-- `ui_formatter`: pure value/string formatting for resistance, capacitance, frequency, duty, and centered editor text.
-
-### Services
-- `config_service`: owns runtime frequency/duty/step settings and requests persistence.
-- `measurement_service`: owns resistor/capacitor/frequency/duty measurement workflows, measurement-mode transitions, and UI-facing measurement status (`MEASURING`, `CHARGING`, `NO_SIGNAL`, `NO_COMPONENT`, `ERROR`, etc.).
-- `signal_generator_service`: clamps requested PWM settings and calculates timer prescaler/ARR/CCR values.
-
-### Drivers
-- `adc_driver`: interrupt-driven 16-sample ADC batches and LPF.
-- `button_driver`: GPIO button sampling, 20 ms debounce, and event queue.
-- `capacitor_charge_driver`: PA5 charge/discharge hardware control.
-- `flash_storage_driver`: versioned + CRC-protected Flash record at the reserved final page.
-- `lcd1602_driver`: LCD1602/PCF8574 over I2C2 with timeout/error handling.
-- `pwm_capture_driver`: TIM1/TIM3/TIM4 input capture and active-range selection.
-- `pwm_output_driver`: TIM2 CH2 hardware initialization/enable/disable and timer-register application.
-
-### Infrastructure
-- `debug_logger`: timestamped UART log levels.
-- `error_manager`: in-RAM error history/coalescing/flush.
-
-### Platform
-- `platform_init`: wrapper around MCU `SystemInit()`.
-- `system_time`: SysTick 1 ms timebase.
-- `uart_port`: low-level USART1 transport used by diagnostics.
-
-## 4. Runtime flow (unchanged)
+The firmware uses a cooperative super-loop rather than an RTOS. Initialization is centralized in `AppController_Init()`, followed by repeated non-blocking processing passes.
 
 ```text
 Reset
   -> AppController_Init()
-      -> Platform_InitSystem()
-      -> ErrorManager_Init()
-      -> ConfigService_Init() -> FlashStorage_Load()
-      -> SystemTime_Init()
-      -> ButtonDriver_Init()
-      -> UartPort_Init() / DebugLogger
-      -> MeasurementService_Init()
-      -> SignalGeneratorService_Init()
-      -> Lcd1602Driver_Init()
-      -> UiController_Init()
+       -> Platform_InitSystem()
+       -> ErrorManager_Init()
+       -> ConfigService_Init() -> FlashStorage_Load()
+       -> SystemTime_Init()
+       -> ButtonDriver_Init()
+       -> UartPort_Init() / DebugLogger
+       -> MeasurementService_Init()
+       -> SignalGeneratorService_Init()
+       -> Lcd1602Driver_Init()
+       -> UiController_Init()
 
 while (1)
   -> AppController_RunOnce()
-      -> ButtonDriver_Process()
-      -> consume ButtonEvent_t
-      -> UiController_HandleEvent()
-      -> UiController_Update()
+       -> ButtonDriver_Process()
+       -> consume ButtonEvent_t
+       -> UiController_HandleEvent()
+       -> UiController_Update()
 ```
 
-## 5. Measurement flow
+Time-critical peripheral work is interrupt-driven. State progression, UI decisions, persistence requests, and presentation remain in the main context, keeping interrupt handlers focused and avoiding RTOS/scheduler state.
 
-`ui_controller` no longer manipulates ADC/TIM or LCD1602 directly. It selects a measurement mode:
+## 4. UI architecture
+
+UI decision, presentation, and formatting responsibilities are separate:
+
+```text
+ButtonEvent_t
+  -> UiController
+       -> decides state / navigation / action
+       -> invokes Services for use cases
+       -> UiView
+            -> UiFormatter for text conversion
+            -> Lcd1602Driver for display I/O
+```
+
+Key boundaries:
+
+- `ui_controller.c` owns state and navigation, not LCD rendering details.
+- `ui_view.c` owns display composition and LCD updates.
+- `ui_formatter.c` has no hardware or service dependency.
+- Measurement state comes from `MeasurementService_GetStatus()` rather than being inferred from a numeric result such as `0.0`.
+
+The startup splash and save-confirmation screen are timed UI states using `SystemTime_GetTick()`. They do not block the super-loop with application-level delays. List-style menus also retain their own cursor positions so returning from a child screen restores the expected selection.
+
+## 5. Measurement data flow
+
+The UI selects a measurement mode; the Measurement Service owns the workflow and delegates hardware access to drivers.
 
 ```text
 UiController
   -> MeasurementService_SetMode()
-       -> resistor: ADC driver
-       -> capacitor: ADC + capacitor charge driver
-       -> freq/duty: PWM output + PWM capture drivers
+       -> Resistance
+            -> AdcDriver
+       -> Capacitance
+            -> AdcDriver
+            -> CapacitorChargeDriver
+       -> Frequency / Duty
+            -> PwmCaptureDriver
+            -> PwmOutputDriver where the test/output path requires it
+
+UiController
+  <- MeasurementService_GetStatus()
+  <- measurement result
 ```
 
-The service also exposes `MeasurementService_GetStatus()`. The UI never infers state from a numeric result such as `0.0`; it renders `Measuring...`, `Press Charge`, `Discharging...`, `Charging...`, `No Signal`, or `Error` from the service state.
+The service exposes explicit states such as `MEASURING`, `CHARGING`, `NO_SIGNAL`, `NO_COMPONENT`, and `ERROR`, keeping presentation logic independent from raw peripheral values.
 
-The original All Mode resource-sharing behavior is retained:
-- Resistor -> Capacitor keeps ADC enabled and cancels only the old conversion batch.
-- Frequency -> Duty keeps PWM capture/output enabled.
+Sequential **All Mode** also preserves compatible hardware ownership across adjacent measurements:
 
-## 6. Signal generation flow
+- Resistance -> Capacitance keeps the ADC initialized and cancels only the previous conversion batch.
+- Frequency -> Duty keeps PWM capture/output resources active where appropriate.
+
+Detailed formulas, filtering, timing ranges, and component-detection behavior are documented in [docs/measurement.md](docs/measurement.md) and [docs/validation.md](docs/validation.md).
+
+## 6. Signal-generation flow
+
+PWM configuration separates policy/calculation from register-level application:
 
 ```text
 UiController
   -> ConfigService
   -> SignalGeneratorService_Apply()
-       -> calculate PSC/ARR/CCR
+       -> validate requested frequency / duty
+       -> calculate PSC / ARR / CCR
        -> PwmOutputDriver_ApplyTimer()
+            -> TIM2 CH2 registers
 ```
 
-The Service layer contains the frequency calculation. The Driver layer alone writes TIM2 registers.
+Timer calculations belong to the Service layer; direct TIM2 register programming belongs to the Driver layer.
 
-## 7. Non-blocking boot splash
+## 7. Persistence and diagnostics
 
-The boot title is a transient UI state, not a presentation delay:
-
-```text
-UiController_Init()
-  -> MENU_SPLASH
-       -> render project title
-       -> store splashStartTick
-
-AppController_RunOnce() continues normally
-  -> ButtonDriver_Process()
-  -> UiController_Update()
-       -> after 2000 ms
-       -> MENU_MAIN
-```
-
-Button events are ignored while the splash is visible, but the application super-loop is not blocked. There is no `SystemTime_DelayMs()` in the Application layer.
-
-## 8. Non-blocking save feedback
-
-Configuration confirmation is represented by a transient UI state rather than a delay:
-
-```text
-SELECT
-  -> ConfigService_Save()
-  -> MENU_SAVE_FEEDBACK
-       -> Saved! / Save Error
-       -> wait 800 ms using SystemTime_GetTick()
-       -> next menu (or return to the same editor on save failure)
-```
-
-Button events are ignored while the short feedback state is active. The super-loop continues to run; no `DelayMs()` is used for save feedback.
-
-## 9. Per-menu cursor memory
-
-Each list-style UI state owns its own cursor slot:
-
-```text
-Main        -> remembers Measure / Transmit
-Measure     -> remembers Single / All
-Single Mode -> remembers Resistor / Capacitor / Frequency / Duty
-Transmit    -> remembers Frequency / Duty / Setting
-```
-
-Entering a child state does not overwrite the parent cursor. Returning from a measurement or editor therefore highlights the item that launched it. `Back` is treated as a navigation command rather than a resume position; selecting it restores the menu's last non-Back item before leaving.
-
-## 10. UI responsibility split
-
-The Application UI is split by responsibility without changing the menu flow:
-
-```text
-ButtonEvent_t
-  -> UiController
-       -> decides state/navigation/action
-       -> UiView
-            -> requests formatting from UiFormatter
-            -> writes through Lcd1602Driver
-```
-
-Rules:
-- `ui_controller.c` does not include or call `lcd1602_driver` and does not format display strings.
-- `ui_view.c` owns all LCD1602 rendering details and custom scroll-character placement.
-- `ui_formatter.c` has no hardware/service dependency; it only converts values to display text.
-
-This keeps the existing FSM, 300 ms smart refresh, non-blocking splash/save feedback, measurement statuses, and per-menu cursor memory unchanged.
-
-## 11. Persistent settings flow
+### Persistent configuration
 
 ```text
 UiController
   -> ConfigService_Save()
        -> FlashStorage_Save()
-            -> version + CRC + verify
+            -> metadata + CRC
+            -> program
+            -> read-back verify
 
 Reset
   -> ConfigService_Init()
        -> FlashStorage_Load()
 ```
 
-The final 1 KB Flash page (`0x0800FC00..0x0800FFFF`) remains reserved from application code.
+The final 1 KB Flash page (`0x0800FC00..0x0800FFFF`) is reserved for configuration storage and excluded from application code placement.
 
-## 12. Old -> new file mapping
+### Diagnostics
 
-| Previous file | New file |
-|---|---|
-| `app.c` | `Application/app_controller.c` |
-| `menu.c` | `Application/ui_controller.c` + `ui_view.c` + `ui_formatter.c` |
-| `app_config.c` | `Services/config_service.c` |
-| `measure.c` | `Services/measurement_service.c` |
-| `transmit.c` | `Services/signal_generator_service.c` |
-| `adc.c` | `Drivers/adc_driver.c` |
-| `gpio.c` | `Drivers/button_driver.c` |
-| charge GPIO inside `measure.c` | `Drivers/capacitor_charge_driver.c` |
-| `i2c2_lcd.c` | `Drivers/lcd1602_driver.c` |
-| `pwm_input.c` | `Drivers/pwm_capture_driver.c` |
-| `pwm_output.c` | `Drivers/pwm_output_driver.c` |
-| `flash.c` | `Drivers/flash_storage_driver.c` |
-| `debug_log.c` | `Infrastructure/debug_logger.c` |
-| `error_manager.c` | `Infrastructure/error_manager.c` |
-| `systick.c` | `Platform/system_time.c` |
-| `usart1.c` | `Platform/uart_port.c` |
+```text
+Application / Services / Drivers
+  -> DebugLogger
+       -> SystemTime
+       -> UartPort -> USART1
 
+Runtime faults
+  -> ErrorManager
+       -> in-RAM history / coalescing
+       -> DebugLogger when reported or flushed
+```
 
-## Component-presence validation
+Diagnostics are cross-cutting support and do not define measurement policy. `NO_COMPONENT`, for example, is a normal measurement status rather than an Error Manager fault.
 
-- Resistance UI refresh is intentionally held to 1000 ms while ADC acquisition continues at full speed.
-- An open resistor socket is detected near ADC full-scale with hysteresis and three-batch confirmation. The threshold preserves the documented 1 Mohm range; very large resistances above the supported range may intentionally be treated as open.
-- Capacitor presence is validated during the timed low-to-high charging phase. An immediate first-batch threshold crossing is treated as an empty socket / capacitance below the documented 100 nF range.
-- `NO_COMPONENT` is a normal measurement status, not an Error Manager fault.
+## 8. Architectural invariants
+
+1. **Bare-metal runtime:** application sequencing is handled by the super-loop and explicit state machines; no RTOS is required.
+2. **Short interrupt work:** interrupts handle peripheral/timing events while higher-level decisions stay in the main context.
+3. **Policy vs. hardware:** Services own measurement/configuration policy; Drivers own peripheral access and register application.
+4. **UI separation:** the controller chooses what happens, the view decides how it is rendered, and the formatter only converts values to text.
+5. **Non-blocking application feedback:** splash and save-feedback timing do not stop the super-loop.
+6. **Explicit measurement states:** no signal, no component, charging, measuring, and error conditions are represented directly.
+7. **Reserved persistence boundary:** the final Flash page is treated as data storage, not program space.
+8. **Downward-only dependencies:** Platform and hardware-facing modules remain independent of application/menu behavior.
+
+## 9. Related documentation
+
+- [README.md](README.md) — project overview and portfolio landing page.
+- [docs/hardware.md](docs/hardware.md) — pin mapping, peripherals, and clock assumptions.
+- [docs/measurement.md](docs/measurement.md) — measurement and signal-generation algorithms.
+- [docs/runtime.md](docs/runtime.md) — runtime behavior, UI details, persistence, diagnostics, and design trade-offs.
+- [docs/validation.md](docs/validation.md) — recorded hardware validation and limitations.
+- [docs/build-and-flash.md](docs/build-and-flash.md) — Keil build/flash workflow and footprint.
